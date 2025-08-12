@@ -21,12 +21,38 @@
 
   <!-- ESM loader: prefer WebGPU, fall back to WASM -->
 <script type="module">
-  import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1';
+  import { pipeline, env } from './assets/js/transformers.js';
 
-  // Keep WASM assets discoverable for fallback
-  env.backends.onnx.wasm.wasmPaths =
-    'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1/dist/';
+  // Configure ORT WASM distribution path (use CDN due to missing local assets/MIME issues)
+  // Also configure CPU (ONNX Runtime Web) to be a robust fallback when WebGPU is unavailable.
   env.useBrowserCache = true;
+
+  // Force local models only (offline) and point to the local models base path
+  env.localModelPath = new URL('models/', document.baseURI).href;
+  env.allowRemoteModels = false;
+  env.allowLocalModels = true;
+  // Prefer WebGPU first, then CPU/WASM
+  env.backends = ['webgpu', 'wasm'];
+
+  // Configure ORT WASM paths compatibly across transformers.js versions
+  const wasmDist = new URL('assets/transformers/dist/', document.baseURI).href;
+  try {
+    if (env && env.ORT && env.ORT.wasm) {
+      env.ORT.wasm.wasmPaths = wasmDist;
+      env.ORT.wasm.proxy = false;
+      env.ORT.wasm.simd = true;
+      env.ORT.wasm.numThreads =
+        Math.min(2, (navigator && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 2);
+    } else if (env && env.backends && env.backends.onnx && env.backends.onnx.wasm) {
+      env.backends.onnx.wasm.wasmPaths = wasmDist;
+      env.backends.onnx.wasm.proxy = false;
+      env.backends.onnx.wasm.simd = true;
+      env.backends.onnx.wasm.numThreads =
+        Math.min(2, (navigator && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 2);
+    }
+  } catch (e) {
+    console.warn('[Embeddings] ORT WASM config skipped:', e);
+  }
 
   // Helper: pick backend. You can override via ?backend=webgpu|wasm
   const urlBackend = new URLSearchParams(location.search).get('backend');
@@ -34,11 +60,15 @@
   const preferWebGPU = (urlBackend ? urlBackend === 'webgpu' : true) && supportsWebGPU;
 
   async function makePipe(backend, dtypeOverride) { // Add dtypeOverride parameter
-    const opts =
-      backend === 'webgpu'
-        ? { device: 'webgpu', dtype: dtypeOverride || 'fp16' } // Use dtypeOverride or default fp16
-        : { dtype: 'q8' }; // WASM
-    return pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', opts);
+    if (backend === 'webgpu') {
+      // Use WebGPU with requested dtype (fp16 default, fp32 fallback when needed)
+      return pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+        device: 'webgpu',
+        dtype: dtypeOverride || 'fp16'
+      });
+    }
+    // For CPU/WASM, do not pass device/dtype — let transformers.js select ONNX/WASM via env
+    return pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
   }
 
   // Expose a lazy global with auto-fallback
@@ -75,11 +105,15 @@
       }
     }
 
-    // If WebGPU failed or was not preferred, try WASM
+    // If WebGPU failed or was not preferred, try CPU/WASM explicitly
     if (!window.__embedPipe && backendToTry === 'wasm') {
-      console.log(`[Embeddings] Trying WASM…`);
-      window.__embedPipe = await makePipe('wasm');
-      window.__embedBackend = 'wasm';
+      try {
+        console.log(`[Embeddings] Trying CPU/WASM…`);
+        window.__embedPipe = await makePipe('wasm');
+        window.__embedBackend = 'wasm';
+      } catch (e) {
+        console.error('[Embeddings] CPU/WASM initialization failed.', e);
+      }
     }
 
     if (!window.__embedPipe) {
